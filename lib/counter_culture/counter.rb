@@ -36,59 +36,61 @@ module CounterCulture
     def change_counter_cache(obj, options)
       change_counter_column = options.fetch(:counter_column) { counter_cache_name_for(obj) }
 
-      # default to the current foreign key value
-      id_to_change = foreign_key_value(obj, relation, options[:was])
-      # allow overwriting of foreign key value by the caller
-      id_to_change = foreign_key_values.call(id_to_change) if foreign_key_values
+      if change_counter_column
+        # default to the current foreign key value
+        id_to_change = foreign_key_value(obj, relation, options[:was])
+        # allow overwriting of foreign key value by the caller
+        id_to_change = foreign_key_values.call(id_to_change) if foreign_key_values
 
-      if id_to_change && change_counter_column
-        delta_magnitude = if delta_column
-                            (options[:was] ? attribute_was(obj, delta_column) : obj.public_send(delta_column)) || 0
-                          else
-                            counter_delta_magnitude_for(obj)
-                          end
-        # increment or decrement?
-        operator = options[:increment] ? '+' : '-'
+        if id_to_change
+          delta_magnitude = if delta_column
+                              (options[:was] ? attribute_was(obj, delta_column) : obj.public_send(delta_column)) || 0
+                            else
+                              counter_delta_magnitude_for(obj)
+                            end
+          # increment or decrement?
+          operator = options[:increment] ? '+' : '-'
 
-        # we don't use Rails' update_counters because we support changing the timestamp
-        quoted_column = model.connection.quote_column_name(change_counter_column)
+          # we don't use Rails' update_counters because we support changing the timestamp
+          quoted_column = model.connection.quote_column_name(change_counter_column)
 
-        updates = []
-        # this updates the actual counter
-        updates << "#{quoted_column} = COALESCE(#{quoted_column}, 0) #{operator} #{delta_magnitude}"
-        # and here we update the timestamp, if so desired
-        if touch
-          current_time = obj.send(:current_time_from_proper_timezone)
-          timestamp_columns = obj.send(:timestamp_attributes_for_update_in_model)
-          timestamp_columns << touch if touch != true
-          timestamp_columns.each do |timestamp_column|
-            updates << "#{timestamp_column} = '#{current_time.to_formatted_s(:db)}'"
-          end
-        end
-
-        klass = relation_klass(relation, source: obj, was: options[:was])
-        primary_key = relation_primary_key(relation, source: obj, was: options[:was])
-
-        if @with_papertrail
-          instance = klass.where(primary_key => id_to_change).first
-          if instance
-            if instance.paper_trail.respond_to?(:save_with_version)
-              # touch_with_version is deprecated starting in PaperTrail 9.0.0
-
-              current_time = obj.send(:current_time_from_proper_timezone)
-              timestamp_columns = obj.send(:timestamp_attributes_for_update_in_model)
-              timestamp_columns.each do |timestamp_column|
-                instance.send("#{timestamp_column}=", current_time)
-              end
-
-              instance.paper_trail.save_with_version(validate: false)
-            else
-              instance.paper_trail.touch_with_version
+          updates = []
+          # this updates the actual counter
+          updates << "#{quoted_column} = COALESCE(#{quoted_column}, 0) #{operator} #{delta_magnitude}"
+          # and here we update the timestamp, if so desired
+          if touch
+            current_time = obj.send(:current_time_from_proper_timezone)
+            timestamp_columns = obj.send(:timestamp_attributes_for_update_in_model)
+            timestamp_columns << touch if touch != true
+            timestamp_columns.each do |timestamp_column|
+              updates << "#{timestamp_column} = '#{current_time.to_formatted_s(:db)}'"
             end
           end
-        end
 
-        klass.where(primary_key => id_to_change).update_all updates.join(', ')
+          klass = relation_klass(relation, source: obj, was: options[:was])
+          primary_key = relation_primary_key(relation, source: obj, was: options[:was])
+
+          if @with_papertrail
+            instance = klass.where(primary_key => id_to_change).first
+            if instance
+              if instance.paper_trail.respond_to?(:save_with_version)
+                # touch_with_version is deprecated starting in PaperTrail 9.0.0
+
+                current_time = obj.send(:current_time_from_proper_timezone)
+                timestamp_columns = obj.send(:timestamp_attributes_for_update_in_model)
+                timestamp_columns.each do |timestamp_column|
+                  instance.send("#{timestamp_column}=", current_time)
+                end
+
+                instance.paper_trail.save_with_version(validate: false)
+              else
+                instance.paper_trail.touch_with_version
+              end
+            end
+          end
+
+          klass.where(primary_key => id_to_change).update_all updates.join(', ')
+        end
       end
     end
 
@@ -131,24 +133,35 @@ module CounterCulture
     #   pass true to get the past value, false or nothing to get the
     #   current value
     def foreign_key_value(obj, relation, was = false)
-      relation = relation.is_a?(Enumerable) ? relation.dup : [relation]
-      first_relation = relation.first
-      if was
-        first = relation.shift
-        foreign_key_value = attribute_was(obj, relation_foreign_key(first))
-        klass = relation_klass(first, source: obj, was: was)
-        if foreign_key_value
-          value = klass.where(
-            "#{klass.table_name}.#{relation_primary_key(first, source: obj, was: was)} = ?",
-            foreign_key_value).first
+      if relation.is_a?(Enumerable) && relation.size > 1
+        relation = relation.is_a?(Enumerable) ? relation.dup : [relation]
+        first_relation = relation.first
+
+        if was
+          first = relation.shift
+          foreign_key_value = attribute_was(obj, relation_foreign_key(first))
+          klass = relation_klass(first, source: obj, was: was)
+          if foreign_key_value
+            value = klass.where(
+              "#{klass.table_name}.#{relation_primary_key(first, source: obj, was: was)} = ?",
+              foreign_key_value).first
+          end
+        else
+          value = obj
         end
+        while !value.nil? && relation.size > 0
+          value = value.send(relation.shift)
+        end
+        return value.try(relation_primary_key(first_relation, source: obj, was: was).try(:to_sym))
       else
-        value = obj
+        first_relation = relation.is_a?(Enumerable) ? relation.first : relation
+        foreign_key = relation_foreign_key(first_relation)
+        if was
+          foreign_key_value = attribute_was(obj, foreign_key)
+        else
+          obj.public_send(foreign_key)
+        end
       end
-      while !value.nil? && relation.size > 0
-        value = value.send(relation.shift)
-      end
-      return value.try(relation_primary_key(first_relation, source: obj, was: was).try(:to_sym))
     end
 
     # gets the reflect object on the given relation
